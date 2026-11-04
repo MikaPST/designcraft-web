@@ -1,0 +1,7 @@
+services:
+  designcraft-web:
+    image: ghcr.io/mikapst/designcraft-web:latest
+    container_name: designcraft-web
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
