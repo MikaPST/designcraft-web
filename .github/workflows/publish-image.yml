@@ -1,0 +1,189 @@
+name: Build and publish DesignCraft Web
+
+on:
+  schedule:
+    # Weekly rebuild from upstream DesignCraft main (UTC).
+    - cron: "07 5 * * 1"
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "docker-compose.yml"
+      - "README.md"
+      - ".github/workflows/publish-image.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: designcraft-web-publish
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out packaging repository
+        uses: actions/checkout@v4
+
+      - name: Check out DesignCraft source
+        uses: actions/checkout@v4
+        with:
+          repository: storytold/designcraft
+          ref: main
+          path: upstream
+          fetch-depth: 1
+
+      - name: Check out shared font assets
+        uses: actions/checkout@v4
+        with:
+          repository: storytold/craft-fonts
+          ref: main
+          path: craft-fonts
+          fetch-depth: 1
+
+      - name: Record source revisions
+        id: source
+        shell: bash
+        run: |
+          echo "designcraft_sha=$(git -C upstream rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "designcraft_short=$(git -C upstream rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "craft_fonts_sha=$(git -C craft-fonts rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust and WebAssembly target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "upstream -> upstream/target"
+
+      - name: Install Trunk
+        shell: bash
+        run: cargo install trunk --locked
+
+      - name: Build DesignCraft WebAssembly app
+        shell: bash
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          export CRAFT_FONTS_DIR="${GITHUB_WORKSPACE}/craft-fonts"
+          cd upstream/apps/designcraft-web
+          trunk build --release
+
+      - name: Prepare Docker build context and NGINX configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WEB_DIST="upstream/dist/web"
+          test -f "${WEB_DIST}/index.html"
+          test -n "$(find "${WEB_DIST}" -type f -name '*.wasm' -print -quit)"
+          test -n "$(find "${WEB_DIST}" -type f -name '*.js' -print -quit)"
+
+          mkdir -p docker-build/dist
+          cp -a "${WEB_DIST}/." docker-build/dist/
+
+          cat > docker-build/nginx.conf <<'NGINX'
+          server {
+              listen 8080;
+              listen [::]:8080;
+              server_name _;
+
+              root /usr/share/nginx/html;
+              index index.html;
+
+              include /etc/nginx/mime.types;
+              default_type application/octet-stream;
+
+              gzip on;
+              gzip_vary on;
+              gzip_min_length 1024;
+              gzip_types
+                  application/wasm
+                  application/javascript
+                  text/javascript
+                  text/css
+                  text/html
+                  application/json
+                  image/svg+xml;
+
+              location = /index.html {
+                  add_header Cache-Control "no-cache";
+              }
+
+              location / {
+                  try_files $uri $uri/ =404;
+              }
+
+              # Trunk's filehash=true gives generated assets content-hashed names.
+              location ~* \.[0-9a-f]{16,}\.(js|wasm|css|woff2?|ttf|otf|png|jpg|svg)$ {
+                  expires 1y;
+                  add_header Cache-Control "public, immutable";
+              }
+          }
+          NGINX
+
+          cat > docker-build/Dockerfile <<'DOCKERFILE'
+          FROM nginx:alpine
+
+          ARG DESIGNCRAFT_COMMIT
+          ARG CRAFT_FONTS_COMMIT
+
+          LABEL org.opencontainers.image.title="DesignCraft Web"
+          LABEL org.opencontainers.image.description="Self-hosted browser build of DesignCraft"
+          LABEL org.opencontainers.image.source="https://github.com/storytold/designcraft"
+          LABEL org.opencontainers.image.revision="${DESIGNCRAFT_COMMIT}"
+          LABEL io.mikapst.designcraft.craft-fonts-revision="${CRAFT_FONTS_COMMIT}"
+
+          RUN rm -f /etc/nginx/conf.d/default.conf
+
+          COPY nginx.conf /etc/nginx/conf.d/default.conf
+          COPY dist/ /usr/share/nginx/html/
+
+          EXPOSE 8080
+          DOCKERFILE
+
+          test -f docker-build/Dockerfile
+          test -f docker-build/nginx.conf
+          test -f docker-build/dist/index.html
+          echo "Generated Docker build context:"
+          find docker-build -maxdepth 2 -type f | sort | head -80
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/mikapst/designcraft-web
+          tags: |
+            type=raw,value=latest
+            type=raw,value=upstream-${{ steps.source.outputs.designcraft_short }}
+
+      - name: Build and publish multi-platform image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ github.workspace }}/docker-build
+          file: ${{ github.workspace }}/docker-build/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            DESIGNCRAFT_COMMIT=${{ steps.source.outputs.designcraft_sha }}
+            CRAFT_FONTS_COMMIT=${{ steps.source.outputs.craft_fonts_sha }}
