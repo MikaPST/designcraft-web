@@ -110,7 +110,6 @@ jobs:
                   application/javascript
                   text/javascript
                   text/css
-                  text/html
                   application/json
                   image/svg+xml;
 
@@ -123,7 +122,7 @@ jobs:
               }
 
               # Trunk's filehash=true gives generated assets content-hashed names.
-              location ~* \.[0-9a-f]{16,}\.(js|wasm|css|woff2?|ttf|otf|png|jpg|svg)$ {
+              location ~* \.[0-9a-f]+\.(js|wasm|css|woff2?|ttf|otf|png|jpg|svg)$ {
                   expires 1y;
                   add_header Cache-Control "public, immutable";
               }
