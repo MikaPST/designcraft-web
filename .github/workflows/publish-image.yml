@@ -3,7 +3,7 @@ name: Build and publish DesignCraft Web
 on:
   schedule:
     # Weekly rebuild from upstream DesignCraft main (UTC).
-    - cron: "07 5 * * 1"
+    - cron: "17 3 * * *"
   workflow_dispatch:
     inputs:
       upstream_tag:
