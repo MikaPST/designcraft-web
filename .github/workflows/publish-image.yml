@@ -1,27 +1,32 @@
 name: Build and publish DesignCraft Web
 
 on:
-  schedule:
-    # Weekly rebuild from upstream DesignCraft main (UTC).
-    - cron: "17 3 * * *"
   workflow_dispatch:
     inputs:
       upstream_tag:
-        description: "Official upstream release tag (empty = latest)"
+        description: "Official DesignCraft release tag (empty = latest)"
         required: false
         type: string
       force_rebuild:
-        description: "Rebuild an already published release"
+        description: "Rebuild an already published DesignCraft release"
         required: false
         default: false
         type: boolean
+
+  schedule:
+    # Check official upstream releases every day at 03:17 UTC.
+    - cron: "17 3 * * *"
+
   push:
     branches:
       - main
     paths:
+      - ".github/workflows/publish-image.yml"
+      - "Dockerfile"
+      - "nginx.conf"
+      - ".dockerignore"
       - "docker-compose.yml"
       - "README.md"
-      - ".github/workflows/publish-image.yml"
 
 permissions:
   contents: write
@@ -32,15 +37,35 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-and-publish:
+  build-and-push:
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
     steps:
-      - name: Check out packaging repository
+      # --------------------------------------------------
+      # 01. Checkout the version-controlled packaging repo
+      # --------------------------------------------------
+      - name: Checkout packaging repository
         uses: actions/checkout@v4
+        with:
+          path: packaging
 
-      - name: Resolve official upstream release
+      # --------------------------------------------------
+      # 02. Validate all independently maintained files
+      # --------------------------------------------------
+      - name: Validate packaging files
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in Dockerfile nginx.conf .dockerignore docker-compose.yml README.md; do
+            test -s "packaging/$f" || { echo "::error::Missing packaging/$f"; exit 1; }
+          done
+          echo "Packaging files validated."
+
+      # --------------------------------------------------
+      # 03. Resolve an OFFICIAL upstream GitHub Release
+      # --------------------------------------------------
+      - name: Resolve official DesignCraft release
         id: upstream-release
         uses: actions/github-script@v7
         env:
@@ -49,37 +74,51 @@ jobs:
           script: |
             const requested = (process.env.REQUESTED_TAG || '').trim();
             const args = { owner: 'storytold', repo: 'designcraft' };
-            const result = requested
+            const { data: r } = requested
               ? await github.rest.repos.getReleaseByTag({ ...args, tag: requested })
               : await github.rest.repos.getLatestRelease(args);
-            const release = result.data;
-            if (!release.tag_name) throw new Error('No upstream release tag found');
-            core.setOutput('tag', release.tag_name);
-            core.setOutput('url', release.html_url);
-            core.setOutput('body', release.body || '');
-            core.setOutput('prerelease', String(release.prerelease));
-            core.setOutput('published_at', release.published_at || '');
-            core.setOutput('name', release.name || `designcraft ${release.tag_name}`);
+            if (!r.tag_name) throw new Error('No official upstream release tag found');
+            core.setOutput('tag', r.tag_name);
+            core.setOutput('name', r.name || `DesignCraft ${r.tag_name}`);
+            core.setOutput('url', r.html_url);
+            core.setOutput('prerelease', String(r.prerelease));
+            core.setOutput('published_at', r.published_at || '');
+            core.info(`Selected official upstream release: ${r.tag_name}`);
 
-      - name: Check local release
+      # --------------------------------------------------
+      # 04. Skip previously published versions, unless the
+      #     operator forces a rebuild or packaging changed
+      # --------------------------------------------------
+      - name: Check existing MikaPST release
         id: release-check
         uses: actions/github-script@v7
         env:
-          TAG: ${{ steps.upstream-release.outputs.tag }}
+          UPSTREAM_TAG: ${{ steps.upstream-release.outputs.tag }}
           FORCE_REBUILD: ${{ inputs.force_rebuild }}
+          EVENT_NAME: ${{ github.event_name }}
         with:
           script: |
             let exists = false;
             try {
-              await github.rest.repos.getReleaseByTag({ ...context.repo, tag: process.env.TAG });
+              await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag: process.env.UPSTREAM_TAG
+              });
               exists = true;
             } catch (error) {
               if (error.status !== 404) throw error;
             }
-            const forced = process.env.FORCE_REBUILD === 'true' || context.eventName === 'push';
-            core.setOutput('skip', String(exists && !forced));
+            const force = process.env.FORCE_REBUILD === 'true' ||
+                          process.env.EVENT_NAME === 'push';
+            const skip = exists && !force;
+            core.setOutput('skip', String(skip));
+            core.info(skip ? 'Release already packaged: skipping.' : 'Packaging release.');
 
-      - name: Check out DesignCraft source
+      # --------------------------------------------------
+      # 05. Checkout the EXACT upstream version selected
+      # --------------------------------------------------
+      - name: Checkout official DesignCraft source
         if: steps.release-check.outputs.skip != 'true'
         uses: actions/checkout@v4
         with:
@@ -88,7 +127,10 @@ jobs:
           path: upstream
           fetch-depth: 1
 
-      - name: Check out shared font assets
+      # --------------------------------------------------
+      # 06. Checkout shared fonts from their own main branch
+      # --------------------------------------------------
+      - name: Checkout official Craft fonts
         if: steps.release-check.outputs.skip != 'true'
         uses: actions/checkout@v4
         with:
@@ -97,133 +139,150 @@ jobs:
           path: craft-fonts
           fetch-depth: 1
 
-      - name: Record source revisions
+      # --------------------------------------------------
+      # 07. Validate upstream source and its license notices
+      # --------------------------------------------------
+      - name: Validate upstream web build layout
+        if: steps.release-check.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in Cargo.toml Cargo.lock apps/designcraft-web/Trunk.toml \
+                   apps/designcraft-web/index.html LICENSE-MIT LICENSE-APACHE \
+                   NOTICE ASSETS.md; do
+            test -s "upstream/$f" || { echo "::error::Missing upstream/$f"; exit 1; }
+          done
+          test -d craft-fonts/fonts
+          echo "Upstream and fonts checkout validated."
+
+      # --------------------------------------------------
+      # 08. Record complete source revisions for traceability
+      # --------------------------------------------------
+      - name: Record upstream and font revisions
         if: steps.release-check.outputs.skip != 'true'
         id: source
         shell: bash
         run: |
+          set -euo pipefail
           echo "designcraft_sha=$(git -C upstream rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "designcraft_short=$(git -C upstream rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
           echo "craft_fonts_sha=$(git -C craft-fonts rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Record upstream release commit for image tags
-        if: steps.release-check.outputs.skip != 'true'
-        id: release-source
-        shell: bash
-        run: |
-          echo "short=$(git -C upstream rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Install Rust and WebAssembly target
+      # --------------------------------------------------
+      # 09. Install Rust and the WebAssembly compilation target
+      # --------------------------------------------------
+      - name: Install Rust and wasm32 target
         if: steps.release-check.outputs.skip != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
 
-      - name: Cache Rust build artifacts
+      # --------------------------------------------------
+      # 10. Reuse incremental Cargo dependencies across runs
+      # --------------------------------------------------
+      - name: Cache Rust artifacts
         if: steps.release-check.outputs.skip != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "upstream -> upstream/target"
 
+      # --------------------------------------------------
+      # 11. Install official Trunk WebAssembly build tool
+      # --------------------------------------------------
       - name: Install Trunk
         if: steps.release-check.outputs.skip != 'true'
         shell: bash
         run: cargo install trunk --locked
 
-      - name: Build DesignCraft WebAssembly app
-        if: steps.release-check.outputs.skip != 'true'
-        shell: bash
-        env:
-          CARGO_BUILD_JOBS: "2"
-        run: |
-          export CRAFT_FONTS_DIR="${GITHUB_WORKSPACE}/craft-fonts"
-          cd upstream/apps/designcraft-web
-          trunk build --release
-
-      - name: Prepare Docker build context and NGINX configuration
+      # --------------------------------------------------
+      # 12. Use wasm-bindgen-cli matching the upstream lock
+      # --------------------------------------------------
+      - name: Install matching wasm-bindgen CLI
         if: steps.release-check.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
+          WASM_BINDGEN_VERSION="$(python3 - <<'PY'
+          import tomllib
+          from pathlib import Path
+          data = tomllib.loads(Path('upstream/Cargo.lock').read_text())
+          versions = {p['version'] for p in data['package'] if p['name'] == 'wasm-bindgen'}
+          if not versions:
+              raise SystemExit('wasm-bindgen missing from upstream/Cargo.lock')
+          print(max(versions, key=lambda v: tuple(int(n) for n in v.split('-')[0].split('.'))))
+          PY
+          )"
+          cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked
 
+      # --------------------------------------------------
+      # 13. Compile upstream WebAssembly site ONCE
+      # --------------------------------------------------
+      - name: Compile DesignCraft Web with Trunk
+        if: steps.release-check.outputs.skip != 'true'
+        shell: bash
+        working-directory: upstream/apps/designcraft-web
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          set -euo pipefail
+          trunk build --release
+
+      # --------------------------------------------------
+      # 14. Validate build output and assemble Docker context
+      # --------------------------------------------------
+      - name: Prepare static site and versioned Docker context
+        if: steps.release-check.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
           WEB_DIST="upstream/dist/web"
-          test -f "${WEB_DIST}/index.html"
+          test -s "${WEB_DIST}/index.html"
           test -n "$(find "${WEB_DIST}" -type f -name '*.wasm' -print -quit)"
           test -n "$(find "${WEB_DIST}" -type f -name '*.js' -print -quit)"
+          # Trunk's public_url='./' is required for prefix deployments.
+          if grep -Eq '(src|href)="/[^/]' "${WEB_DIST}/index.html"; then
+            echo "::error::Generated index.html uses root-absolute paths."
+            exit 1
+          fi
+          mkdir -p docker-context/site docker-context/legal
+          cp -a "${WEB_DIST}/." docker-context/site/
+          cp packaging/Dockerfile packaging/nginx.conf packaging/.dockerignore docker-context/
+          cp upstream/LICENSE-MIT upstream/LICENSE-APACHE upstream/NOTICE \
+             upstream/ASSETS.md docker-context/legal/
+          if test -d upstream/licenses; then
+            cp -a upstream/licenses docker-context/legal/third-party
+          fi
+          # Preserve all available font OFL notices, independently of build assets.
+          for license in craft-fonts/fonts/*/OFL.txt; do
+            if test -f "$license"; then
+              family="$(basename "$(dirname "$license")")"
+              cp "$license" "docker-context/legal/OFL-${family}.txt"
+            fi
+          done
+          test -s docker-context/site/index.html
+          test -s docker-context/Dockerfile
+          test -s docker-context/nginx.conf
+          echo "Static site and legal notices prepared."
 
-          mkdir -p docker-build/dist
-          cp -a "${WEB_DIST}/." docker-build/dist/
+      # --------------------------------------------------
+      # 15. Emulate ARM64 when publishing from an AMD64 runner
+      # --------------------------------------------------
+      - name: Set up QEMU
+        if: steps.release-check.outputs.skip != 'true'
+        uses: docker/setup-qemu-action@v3
 
-          cat > docker-build/nginx.conf <<'NGINX'
-          server {
-              listen 8080;
-              listen [::]:8080;
-              server_name _;
-
-              root /usr/share/nginx/html;
-              index index.html;
-
-              include /etc/nginx/mime.types;
-              default_type application/octet-stream;
-
-              gzip on;
-              gzip_vary on;
-              gzip_min_length 1024;
-              gzip_types
-                  application/wasm
-                  application/javascript
-                  text/javascript
-                  text/css
-                  application/json
-                  image/svg+xml;
-
-              location = /index.html {
-                  add_header Cache-Control "no-cache";
-              }
-
-              location / {
-                  try_files $uri $uri/ =404;
-              }
-
-              # Trunk's filehash=true gives generated assets content-hashed names.
-              location ~* \.[0-9a-f]+\.(js|wasm|css|woff2?|ttf|otf|png|jpg|svg)$ {
-                  expires 1y;
-                  add_header Cache-Control "public, immutable";
-              }
-          }
-          NGINX
-
-          cat > docker-build/Dockerfile <<'DOCKERFILE'
-          FROM nginx:alpine
-
-          ARG DESIGNCRAFT_COMMIT
-          ARG CRAFT_FONTS_COMMIT
-
-          LABEL org.opencontainers.image.title="DesignCraft Web"
-          LABEL org.opencontainers.image.description="Self-hosted browser build of DesignCraft"
-          LABEL org.opencontainers.image.source="https://github.com/storytold/designcraft"
-          LABEL org.opencontainers.image.revision="${DESIGNCRAFT_COMMIT}"
-          LABEL io.mikapst.designcraft.craft-fonts-revision="${CRAFT_FONTS_COMMIT}"
-
-          RUN rm -f /etc/nginx/conf.d/default.conf
-
-          COPY nginx.conf /etc/nginx/conf.d/default.conf
-          COPY dist/ /usr/share/nginx/html/
-
-          EXPOSE 8080
-          DOCKERFILE
-
-          test -f docker-build/Dockerfile
-          test -f docker-build/nginx.conf
-          test -f docker-build/dist/index.html
-          echo "Generated Docker build context:"
-          find docker-build -maxdepth 2 -type f | sort | head -80
-
+      # --------------------------------------------------
+      # 16. Initialize the Docker multi-platform builder
+      # --------------------------------------------------
       - name: Set up Docker Buildx
         if: steps.release-check.outputs.skip != 'true'
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GitHub Container Registry
+      # --------------------------------------------------
+      # 17. Authenticate to the GitHub Container Registry
+      # --------------------------------------------------
+      - name: Log in to GHCR
         if: steps.release-check.outputs.skip != 'true'
         uses: docker/login-action@v3
         with:
@@ -231,7 +290,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate image metadata
+      # --------------------------------------------------
+      # 18. Create latest, official version and SHA image tags
+      # --------------------------------------------------
+      - name: Generate Docker image metadata
         if: steps.release-check.outputs.skip != 'true'
         id: meta
         uses: docker/metadata-action@v5
@@ -242,72 +304,91 @@ jobs:
             type=raw,value=${{ steps.upstream-release.outputs.tag }}
             type=raw,value=upstream-${{ steps.source.outputs.designcraft_short }}
 
-      - name: Build and publish multi-platform image
+      # --------------------------------------------------
+      # 19. Build & PUSH: Rust was compiled only once above
+      # --------------------------------------------------
+      - name: Build and publish multi-platform Docker image
         if: steps.release-check.outputs.skip != 'true'
         id: build
         uses: docker/build-push-action@v6
         with:
-          context: ${{ github.workspace }}/docker-build
-          file: ${{ github.workspace }}/docker-build/Dockerfile
-          push: true
+          context: ./docker-context
+          file: ./docker-context/Dockerfile
           platforms: linux/amd64,linux/arm64
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             DESIGNCRAFT_COMMIT=${{ steps.source.outputs.designcraft_sha }}
             CRAFT_FONTS_COMMIT=${{ steps.source.outputs.craft_fonts_sha }}
+            DESIGNCRAFT_VERSION=${{ steps.upstream-release.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Create or update versioned GitHub Release
+      # --------------------------------------------------
+      # 20. Only after a successful GHCR push, publish the
+      #     matching MikaPST GitHub Release and its digest
+      # --------------------------------------------------
+      - name: Create or update matching GitHub Release
         if: steps.release-check.outputs.skip != 'true'
         uses: actions/github-script@v7
         env:
-          RELEASE_TAG: ${{ steps.upstream-release.outputs.tag }}
-          RELEASE_NAME: ${{ steps.upstream-release.outputs.name }}
-          RELEASE_URL: ${{ steps.upstream-release.outputs.url }}
-          RELEASE_NOTES: ${{ steps.upstream-release.outputs.body }}
-          RELEASE_PRERELEASE: ${{ steps.upstream-release.outputs.prerelease }}
-          RELEASE_PUBLISHED_AT: ${{ steps.upstream-release.outputs.published_at }}
-          RELEASE_SOURCE_SHA: ${{ steps.release-source.outputs.short }}
-          RELEASE_DIGEST: ${{ steps.build.outputs.digest }}
+          UPSTREAM_TAG: ${{ steps.upstream-release.outputs.tag }}
+          UPSTREAM_NAME: ${{ steps.upstream-release.outputs.name }}
+          UPSTREAM_URL: ${{ steps.upstream-release.outputs.url }}
+          UPSTREAM_DATE: ${{ steps.upstream-release.outputs.published_at }}
+          UPSTREAM_PRERELEASE: ${{ steps.upstream-release.outputs.prerelease }}
+          UPSTREAM_SHA: ${{ steps.source.outputs.designcraft_sha }}
+          UPSTREAM_SHORT: ${{ steps.source.outputs.designcraft_short }}
+          FONTS_SHA: ${{ steps.source.outputs.craft_fonts_sha }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         with:
           script: |
-            const tag = process.env.RELEASE_TAG;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tag = process.env.UPSTREAM_TAG;
             const image = 'ghcr.io/mikapst/designcraft-web';
+            const { data: upstream } = await github.rest.repos.getReleaseByTag({
+              owner: 'storytold', repo: 'designcraft', tag
+            });
             const body = [
-              `Community-maintained Docker packaging for **${process.env.RELEASE_NAME}**.`,
+              `This release packages **${process.env.UPSTREAM_NAME}** as a self-hosted Docker image.`,
               '',
               '## Docker image',
               `- \`${image}:latest\``,
               `- \`${image}:${tag}\``,
-              `- \`${image}:upstream-${process.env.RELEASE_SOURCE_SHA}\``,
+              `- \`${image}:upstream-${process.env.UPSTREAM_SHORT}\``,
               '',
-              'Platforms: `linux/amd64`, `linux/arm64`.',
+              'Supported platforms: `linux/amd64`, `linux/arm64`.',
               '',
-              `Official upstream release: ${process.env.RELEASE_URL}`,
-              `Published upstream: ${process.env.RELEASE_PUBLISHED_AT || 'not specified'}`,
+              '## Upstream project',
+              `- **Official release:** [${process.env.UPSTREAM_NAME}](${process.env.UPSTREAM_URL})`,
+              `- **Upstream release tag:** \`${tag}\``,
+              `- **Upstream source commit:** \`${process.env.UPSTREAM_SHA}\``,
+              `- **Published upstream:** ${process.env.UPSTREAM_DATE || 'not specified'}`,
+              `- **Shared fonts commit:** \`${process.env.FONTS_SHA}\` (storytold/craft-fonts, main)`,
               '',
-              `Upstream source commit: \`${process.env.RELEASE_SOURCE_SHA}\``,
-              `Docker manifest digest: \`${process.env.RELEASE_DIGEST || 'not reported'}\``,
+              '## Image details',
+              `- **Manifest digest:** \`${process.env.IMAGE_DIGEST || 'not reported'}\``,
+              '- **Packaging:** independently maintained by MikaPST; not an official DesignCraft release.',
+              '- **Build configuration:** Dockerfile, nginx.conf and .dockerignore versioned in MikaPST/designcraft-web.',
               '',
               '## Upstream release notes',
-              process.env.RELEASE_NOTES || 'No release notes provided upstream.',
-              '',
-              'This is an independent Docker packaging release, not an official upstream distribution.'
+              upstream.body || 'No upstream release notes provided.'
             ].join('\n');
             let existing;
             try {
-              existing = (await github.rest.repos.getReleaseByTag({ ...context.repo, tag })).data;
+              ({ data: existing } = await github.rest.repos.getReleaseByTag({ owner, repo, tag }));
             } catch (error) {
               if (error.status !== 404) throw error;
             }
+            const args = {
+              owner, repo, tag_name: tag,
+              name: `DesignCraft Web ${tag}`, body,
+              draft: false, prerelease: process.env.UPSTREAM_PRERELEASE === 'true'
+            };
             if (existing) {
-              await github.rest.repos.updateRelease({
-                ...context.repo, release_id: existing.id, name: 'DesignCraft Web ' + tag,
-                body, draft: false, prerelease: process.env.RELEASE_PRERELEASE === 'true'
-              });
+              await github.rest.repos.updateRelease({ ...args, release_id: existing.id });
             } else {
-              await github.rest.repos.createRelease({
-                ...context.repo, tag_name: tag, target_commitish: context.sha,
-                name: 'DesignCraft Web ' + tag, body, draft: false, prerelease: process.env.RELEASE_PRERELEASE === 'true'
-              });
+              await github.rest.repos.createRelease({ ...args, target_commitish: context.sha });
             }
