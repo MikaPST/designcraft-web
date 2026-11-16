@@ -1,0 +1,15 @@
+**/.git
+**/.github
+**/.DS_Store
+**/.env
+**/.env.*
+**/*.log
+**/target
+**/node_modules
+**/.cache
+**/.cargo
+**/rustup
+*.zip
+*.tar.gz
+README.md
+docker-compose.yml
